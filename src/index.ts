@@ -3,6 +3,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { Client, ClientChannel } from 'ssh2';
+import ssh2pkg from 'ssh2'; // CJS: 'utils' is not a detectable named ESM export
+const ssh2utils = ssh2pkg.utils;
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
@@ -123,6 +125,46 @@ export interface SSHConfig {
   agent?: string;          // path to the SSH_AUTH_SOCK; when set, ssh2 forwards auth to ssh-agent
   suPassword?: string;
   sudoPassword?: string;   // Password for sudo commands specifically (if different from suPassword)
+}
+
+/**
+ * Key/agent auth for SSHConfig.
+ *
+ * With SSH_AUTH_SOCK set, auth goes to the ssh-agent. The --key file is then
+ * only a fallback: it is added as privateKey ONLY when it parses as a private
+ * key (unencrypted, or decryptable with the passphrase). The old code passed
+ * KEY + '.pub' as privateKey "as a hint"; ssh2 rejects a public key there with
+ * "privateKey value does not contain a (valid) private key", so every session
+ * that inherited SSH_AUTH_SOCK lost all SSH MCPs (2026-09-21, 2026-10-23).
+ */
+export async function applyKeyAuth(
+  sshConfig: SSHConfig,
+  key: string | null | undefined,
+  passphrase: string | null | undefined,
+  agentSock: string | null | undefined,
+): Promise<void> {
+  const fs = await import('fs/promises');
+  if (agentSock) {
+    sshConfig.agent = agentSock;
+    if (!key) return;
+    let text: string;
+    try {
+      text = await fs.readFile(key, 'utf8');
+    } catch {
+      return; // agent only
+    }
+    const parsed = ssh2utils.parseKey(text, passphrase ?? undefined);
+    const first = Array.isArray(parsed) ? parsed[0] : parsed;
+    if (first && !(first instanceof Error) && first.isPrivateKey()) {
+      sshConfig.privateKey = text;
+      if (passphrase) sshConfig.passphrase = passphrase;
+    }
+    return;
+  }
+  if (key) {
+    sshConfig.privateKey = await fs.readFile(key, 'utf8');
+    if (passphrase) sshConfig.passphrase = passphrase;
+  }
 }
 
 export class SSHConnectionManager {
@@ -381,25 +423,8 @@ server.tool(
 
         if (PASSWORD) {
           sshConfig.password = PASSWORD;
-        } else if (SSH_AGENT_SOCK) {
-          // Agent-based auth: ssh2 talks to the running ssh-agent over the
-          // socket and the decrypted private key never enters this process.
-          // If the operator additionally provides --key, we still pass the
-          // key path as the public key hint so the agent picks the right
-          // identity when multiple are loaded.
-          sshConfig.agent = SSH_AGENT_SOCK;
-          if (KEY) {
-            const fs = await import('fs/promises');
-            try {
-              sshConfig.privateKey = await fs.readFile(KEY + '.pub', 'utf8');
-            } catch {
-              // Best effort — agent will iterate identities if no hint is given.
-            }
-          }
-        } else if (KEY) {
-          const fs = await import('fs/promises');
-          sshConfig.privateKey = await fs.readFile(KEY, 'utf8');
-          if (PASSPHRASE) sshConfig.passphrase = PASSPHRASE;
+        } else {
+          await applyKeyAuth(sshConfig, KEY, PASSPHRASE, SSH_AGENT_SOCK);
         }
 
         if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
@@ -467,20 +492,8 @@ if (!DISABLE_SUDO) {
           };
           if (PASSWORD) {
             sshConfig.password = PASSWORD;
-          } else if (SSH_AGENT_SOCK) {
-            sshConfig.agent = SSH_AGENT_SOCK;
-            if (KEY) {
-              const fs = await import('fs/promises');
-              try {
-                sshConfig.privateKey = await fs.readFile(KEY + '.pub', 'utf8');
-              } catch {
-                // Best effort — agent will iterate identities if no hint is given.
-              }
-            }
-          } else if (KEY) {
-            const fs = await import('fs/promises');
-            sshConfig.privateKey = await fs.readFile(KEY, 'utf8');
-            if (PASSPHRASE) sshConfig.passphrase = PASSPHRASE;
+          } else {
+            await applyKeyAuth(sshConfig, KEY, PASSPHRASE, SSH_AGENT_SOCK);
           }
           if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
             sshConfig.suPassword = sanitizePassword(SUPASSWORD);
